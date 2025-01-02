@@ -1,0 +1,32 @@
+name: Packer CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  packer-validation:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Install Packer
+      run: |
+        curl -L -o packer.zip https://releases.hashicorp.com/packer/1.9.0/packer_1.9.0_linux_amd64.zip
+        unzip packer.zip
+        sudo mv packer /usr/local/bin/
+
+    - name: Verify Packer Installation
+      run: |
+        packer version  
+    
+    - name: Initialize Packer
+      run: |
+        packer init healthcheck/packer/github_packer.pkr.hcl
+
+    - name: Run packer fmt
+      run: packer fmt -check healthcheck/packer/github_packer.pkr.hcl
+      
+    - name: Run packer validate
+      run: packer validate healthcheck/packer/github_packer.pkr.hcl

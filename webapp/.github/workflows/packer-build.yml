@@ -1,0 +1,139 @@
+name: Build Custom Image with Packer
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-packer-image:
+    runs-on: ubuntu-latest
+    if: github.repository == 'csye6225-ChenniXu/webapp'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Verify AWS CLI Installation
+      run: |
+        aws sts get-caller-identity
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v2
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+  
+    - name: Cache Maven dependencies
+      uses: actions/cache@v2
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/healthcheck/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Install Packer
+      run: |
+        curl -L -o packer.zip https://releases.hashicorp.com/packer/1.9.0/packer_1.9.0_linux_amd64.zip
+        unzip packer.zip
+        sudo mv packer /usr/local/bin/
+
+    - name: Initialize Packer
+      run: |
+        packer init healthcheck/packer/github_packer.pkr.hcl
+
+    - name: Build Application Artifact
+      run: |
+        mvn clean package -f healthcheck/pom.xml
+      env:
+        MAVEN_OPTS: -Xmx1024m
+    
+    - name: Capture Artifact Path
+      id: artifact
+      run: echo "ARTIFACT_PATH=healthcheck/target/healthcheck-0.0.1-SNAPSHOT.jar" >> $GITHUB_ENV
+
+    - name: Build Custom Image
+      run: |
+        packer build -machine-readable -var "artifact_path=${{ env.ARTIFACT_PATH }}" healthcheck/packer/github_packer.pkr.hcl | tee packer_output.log
+  
+    - name: Extract AMI ID from Packer Build Log
+      run: |
+        AMI_ID=$(grep -oP 'ami-\w+' packer_output.log | tail -n 1)
+        echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+  
+    - name: Share AMI with DEMO account
+      run: |
+        aws ec2 modify-image-attribute --image-id ${{ env.AMI_ID }} --launch-permission "Add=[{UserId=442426870429}]" --region us-east-1
+
+    - name: Configure AWS Credentials for Demo
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEMO }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEMO }}
+        aws-region: us-east-1
+
+    - name: Fetch Launch Template ID
+      id: fetch-template-id
+      run: |
+        TEMPLATE_ID=$(aws ec2 describe-launch-templates \
+          --filters Name=launch-template-name,Values=csye6225_asg \
+          --query 'LaunchTemplates[0].LaunchTemplateId' \
+          --output text)
+        echo "TEMPLATE_ID=$TEMPLATE_ID" >> $GITHUB_ENV
+
+    - name: Fetch Auto Scaling Group Name
+      id: fetch-asg-name
+      run: |
+        ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+          --filters Name=tag:Name,Values=web-app-instance \
+          --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+          --output text)
+        echo "ASG_NAME=$ASG_NAME" >> $GITHUB_ENV
+    
+    - name: Create New Launch Template Version
+      run: |
+        aws ec2 create-launch-template-version \
+          --launch-template-id ${{ env.TEMPLATE_ID }} \
+          --source-version \$Latest \
+          --launch-template-data '{"ImageId":"'"${{ env.AMI_ID }}"'"}'
+  
+    - name: Update Auto Scaling Group
+      run: |
+        aws autoscaling update-auto-scaling-group \
+          --auto-scaling-group-name ${{ env.ASG_NAME }} \
+          --launch-template "LaunchTemplateId=${{ env.TEMPLATE_ID }},Version=\$Latest"
+  
+    - name: Start Instance Refresh
+      run: |
+        REFRESH_ID=$(aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name ${{ env.ASG_NAME }} \
+          --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 300}' \
+          --query 'InstanceRefreshId' --output text)
+        echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+  
+    - name: Wait for Instance Refresh to Complete
+      run: |
+        while true; do
+          STATUS=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} \
+            --query "InstanceRefreshes[?InstanceRefreshId=='${{ env.REFRESH_ID }}'].Status" \
+            --output text)
+          echo "Current Status: $STATUS"
+          if [ "$STATUS" == "Successful" ]; then
+            echo "Instance refresh completed successfully."
+            break
+          elif [ "$STATUS" == "Failed" ]; then
+            echo "Instance refresh failed. Exiting."
+            exit 1
+          else
+            echo "Waiting for instance refresh to complete..."
+            sleep 30
+          fi
+        done
